@@ -117,14 +117,20 @@ open class Komga(private val suffix: String = "") :
     private var cachedAlias: String? = null
 
     override val client: OkHttpClient
-        get() {
+        get() = synchronized(this) {
             val currentAlias = mtlsAlias
             if (currentAlias != cachedAlias || cachedClient == null) {
                 cachedAlias = currentAlias
                 cachedClient = buildMtlSClient(currentAlias)
             }
-            return cachedClient!!
+            cachedClient ?: error("buildMtlSClient returned null — this is a bug")
         }
+
+    private val defaultTrustManager: X509TrustManager by lazy {
+        TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            .also { it.init(null as KeyStore?) }
+            .trustManagers[0] as X509TrustManager
+    }
 
     private fun buildMtlSClient(certAlias: String): OkHttpClient {
         val builder = network.client.newBuilder()
@@ -177,16 +183,13 @@ open class Komga(private val suffix: String = "") :
                         init(arrayOf(keyManager), null, SecureRandom())
                     }
 
-                    val tmf = TrustManagerFactory.getInstance(
-                        TrustManagerFactory.getDefaultAlgorithm(),
-                    ).also { it.init(null as KeyStore?) }
-
                     builder.sslSocketFactory(
                         sslContext.socketFactory,
-                        tmf.trustManagers[0] as X509TrustManager,
+                        defaultTrustManager,
                     )
                 }
             } catch (e: Exception) {
+                if (e is InterruptedException) throw e
                 Log.w(logTag, "Failed to load mTLS certificate from KeyChain", e)
             }
         }
@@ -497,44 +500,62 @@ open class Komga(private val suffix: String = "") :
                 summary = if (password.isBlank()) "The user account password" else "*".repeat(password.length),
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
                 key = PREF_PASSWORD,
-                restartRequired = true,
             )
         }
-
         // mTLS client certificate selection
-        val alias = preferences.getString(PREF_MTLS_ALIAS, "")!!
         SwitchPreferenceCompat(screen.context).apply {
-            key = "mTLS_cert_select"
             title = "Client certificate"
-            summary = if (alias.isBlank()) "No certificate selected" else alias
-            isChecked = alias.isNotBlank()
+            key = "mTLS_cert_select"
+
+            fun syncCertificateUi() {
+                val alias = preferences.getString(PREF_MTLS_ALIAS, "")!!
+                isChecked = alias.isNotBlank()
+                summary = alias.ifBlank { "No certificate selected" }
+            }
+            syncCertificateUi()
+
             setOnPreferenceClickListener {
-                // Don't use isChecked — SwitchPreferenceCompat auto-toggles before this fires
                 val hasCert = preferences.getString(PREF_MTLS_ALIAS, "")!!.isNotBlank()
                 if (hasCert) {
-                    // Currently selected → clear it
+                    // Clear certificate
                     preferences.edit()
                         .remove(PREF_MTLS_ALIAS)
                         .apply()
-                    isChecked = false
-                    summary = "No certificate selected"
+                    syncCertificateUi()
                 } else {
-                    // Not selected → open cert picker
+                    // Open cert picker
                     val activity = screen.context.getActivity()
-                    val thisPref = this@apply
                     KeyChain.choosePrivateKeyAlias(
                         activity,
-                        object : KeyChainAliasCallback {
-                            override fun alias(selectedAlias: String?) {
-                                if (selectedAlias != null) {
-                                    preferences.edit()
-                                        .putString(PREF_MTLS_ALIAS, selectedAlias)
-                                        .apply()
-                                    // Update UI immediately — callback runs on main thread
-                                    thisPref.isChecked = true
-                                    thisPref.summary = selectedAlias
+                        KeyChainAliasCallback { selectedAlias ->
+                            if (selectedAlias != null) {
+                                // Validate the certificate loads before saving preference
+                                try {
+                                    val privateKey = KeyChain.getPrivateKey(applicationContext, selectedAlias)
+                                    val certChain = KeyChain.getCertificateChain(applicationContext, selectedAlias)
+                                    if (privateKey != null && certChain != null && certChain.isNotEmpty()) {
+                                        preferences.edit()
+                                            .putString(PREF_MTLS_ALIAS, selectedAlias)
+                                            .apply()
+                                    } else {
+                                        Toast.makeText(
+                                            applicationContext,
+                                            "Failed to load client certificate",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(logTag, "Failed to load mTLS certificate after selection", e)
+                                    Toast.makeText(
+                                        applicationContext,
+                                        "Failed to load certificate: ${e.message}",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
                                 }
                             }
+                            // Sync UI from preference source of truth —
+                            // handles success, cancel, and validation failure
+                            syncCertificateUi()
                         },
                         null,
                         null,
